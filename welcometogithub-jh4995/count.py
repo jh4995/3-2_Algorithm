@@ -19,3 +19,4 @@ if __name__ == "__main__":
     print(f"JSON 파일 개수: {json_count}")
 
     print(f"전체 파일 크기: {total_size} 바이트")
+
