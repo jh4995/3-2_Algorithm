@@ -64,7 +64,7 @@ class Searcher:
         verbose = False
         and_mode = False
         phrase_mode = False
-        fields = []
+        explicit_fields = []  # 명시적으로 지정된 필드
         
         # [...]로 둘러싸인 부분 추출
         pattern = r'\[([^\]]+)\]'
@@ -81,23 +81,38 @@ class Searcher:
             elif match_upper.startswith('FIELD='):
                 field_char = match_upper[6:]
                 if field_char in ['T', 'A', 'C']:
-                    fields.append(field_char)
+                    explicit_fields.append(field_char)
         
         # 브래킷 부분 제거하여 순수 쿼리 추출
         pure_query = re.sub(pattern, '', user_query).strip()
         
         # Field가 지정되지 않으면 전체 필드 사용
-        if not fields:
+        if not explicit_fields:
             fields = ['T', 'A', 'C']
+        else:
+            fields = explicit_fields
         
         return {
             'verbose': verbose,
             'and_mode': and_mode,
             'phrase_mode': phrase_mode,
             'fields': fields,
+            'explicit_fields': explicit_fields,
             'query_text': pure_query,
             'original_query': user_query
         }
+    
+    def validate_query(self, parsed):
+        """쿼리 조합 유효성 검증. 오류 시 오류 메시지 반환, 정상이면 None 반환"""
+        if parsed['phrase_mode']:
+            # PHRASE + AND 불가
+            if parsed['and_mode']:
+                return "오류: [PHRASE]와 [AND]는 동시에 사용할 수 없습니다."
+            # PHRASE + FIELD=A 또는 FIELD=C 불가
+            explicit = parsed['explicit_fields']
+            if 'A' in explicit or 'C' in explicit:
+                return "오류: [PHRASE]는 Title에서만 검색하므로 [FIELD=A] 또는 [FIELD=C]와 함께 사용할 수 없습니다."
+        return None
     
     def calculate_idf(self, df):
         """BM25 IDF 계산 (8페이지 공식)"""
@@ -127,13 +142,11 @@ class Searcher:
                         break
                 
                 if tf > 0:
-                    # 필드별 문서 길이
                     dl = doc_info[f"len_{field}"]
                     avgdl = self.avgdl[field]
                     b_f = self.FIELD_B[field]
                     w_f = self.FIELD_WEIGHTS[field]
                     
-                    # 길이 정규화된 TF
                     if avgdl > 0:
                         normalized_tf = tf / ((1 - b_f) + b_f * (dl / avgdl))
                     else:
@@ -141,7 +154,6 @@ class Searcher:
                     
                     tf_tilde += w_f * normalized_tf
             
-            # BM25F 점수 계산
             if tf_tilde > 0:
                 term_score = idf * ((self.K1 + 1) * tf_tilde) / (self.K1 + tf_tilde)
                 score += term_score
@@ -155,7 +167,7 @@ class Searcher:
             doc_sets = []
             for term in query_terms:
                 if term not in self.term_dict:
-                    return set()  # term이 없으면 결과 없음
+                    return set()
                 
                 term_docs = set()
                 for field in fields:
@@ -164,14 +176,13 @@ class Searcher:
                         term_docs.add(doc_id)
                 
                 if not term_docs:
-                    return set()  # 해당 필드에 term이 없으면 결과 없음
+                    return set()
                 
                 doc_sets.append(term_docs)
             
             if not doc_sets:
                 return set()
             
-            # 모든 term이 존재하는 문서의 교집합
             result = doc_sets[0]
             for doc_set in doc_sets[1:]:
                 result = result & doc_set
@@ -188,10 +199,32 @@ class Searcher:
                         result.add(doc_id)
             return result
     
+    def phrase_search(self, query_text, query_terms):
+        """PHRASE 검색: Title에서 exact matching (substring matching)"""
+        # 1단계: query의 모든 term이 Title에 존재하는 문서 필터링 (속도 최적화)
+        candidate_docs = self.get_candidate_docs(query_terms, ['T'], and_mode=True)
+        
+        # 2단계: 해당 문서들의 Title에서 query_text가 substring으로 존재하는지 확인
+        matched_docs = []
+        for doc_id in candidate_docs:
+            doc_info = self.doc_table[str(doc_id)]
+            title_text = doc_info.get("T_text", "")
+            if query_text in title_text:
+                matched_docs.append(doc_id)
+        
+        return matched_docs
+    
     def process_query(self, user_query):
         """쿼리 처리 메인 함수"""
         # 쿼리 파싱
         parsed = self.parse_query(user_query)
+        
+        # 쿼리 조합 유효성 검증
+        error_msg = self.validate_query(parsed)
+        if error_msg:
+            print(error_msg)
+            return
+        
         query_terms = extract_terms(parsed['query_text'])
         
         if not query_terms:
@@ -200,15 +233,26 @@ class Searcher:
             print("총 0개 문서 검색")
             return
         
-        # 후보 문서 집합 구하기
-        candidate_docs = self.get_candidate_docs(query_terms, parsed['fields'], parsed['and_mode'])
-        
-        # BM25F 점수 계산
-        doc_scores = {}
-        for doc_id in candidate_docs:
-            score = self.calculate_bm25f_score(query_terms, doc_id, parsed['fields'])
-            if score > 0:
-                doc_scores[doc_id] = score
+        # PHRASE 모드 처리
+        if parsed['phrase_mode']:
+            # PHRASE: Title에서 exact matching
+            matched_docs = self.phrase_search(parsed['query_text'], query_terms)
+            
+            # BM25F 점수 계산 (Title 필드만 사용)
+            doc_scores = {}
+            for doc_id in matched_docs:
+                score = self.calculate_bm25f_score(query_terms, doc_id, ['T'])
+                if score > 0:
+                    doc_scores[doc_id] = score
+        else:
+            # 일반 검색 (OR 또는 AND)
+            candidate_docs = self.get_candidate_docs(query_terms, parsed['fields'], parsed['and_mode'])
+            
+            doc_scores = {}
+            for doc_id in candidate_docs:
+                score = self.calculate_bm25f_score(query_terms, doc_id, parsed['fields'])
+                if score > 0:
+                    doc_scores[doc_id] = score
         
         # 랭킹
         ranked_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)

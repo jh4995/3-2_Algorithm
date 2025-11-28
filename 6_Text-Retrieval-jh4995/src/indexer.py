@@ -180,15 +180,15 @@ class Indexer:
                     processed_files += 1
                     
                     # 테스트용: 1000개 파일만 처리
-                    if processed_files >= 1000:
-                        break
+                    # if processed_files >= 1000:
+                    #     break
                     
                     if processed_files % 1000 == 0:
                         print(f"처리된 파일: {processed_files:,}개")
             
             # 테스트용: 1000개 파일만 처리 (외부 루프 break)
-            if processed_files >= 1000:
-                break
+            # if processed_files >= 1000:
+            #     break
         
         # 결과 파일들 저장
         save_doc_table(doc_table, total_len_t, total_len_a, total_len_c, processed_files)
