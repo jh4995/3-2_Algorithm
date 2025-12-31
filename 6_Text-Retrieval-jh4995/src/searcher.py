@@ -7,8 +7,14 @@ from .tokenizer import extract_terms
 
 class Searcher:
     
-    def __init__(self, index_dir, doc_table_file, term_dict_file, 
-                 postings_file_T, postings_file_A, postings_file_C):
+    # BM25F 파라미터
+    K1 = 1.1
+    FIELD_WEIGHTS = {'T': 2.5, 'A': 1.5, 'C': 1.1}
+    FIELD_B = {'T': 0.3, 'A': 0.75, 'C': 0.8}
+    FIELD_NAMES = {'T': 'TITLE', 'A': 'ABSTRACT', 'C': 'CLAIMS'}
+    WINDOW_SIZE = 80
+    
+    def __init__(self, index_dir, doc_table_file, term_dict_file, postings_file):
         self.index_dir = os.path.abspath(index_dir)
         
         term_dict_path = os.path.join(self.index_dir, term_dict_file)
@@ -17,493 +23,463 @@ class Searcher:
         
         doc_table_path = os.path.join(self.index_dir, doc_table_file)
         with open(doc_table_path, 'r', encoding='utf8') as f:
-            doc_table_data = json.load(f)
-            self.meta = doc_table_data.pop("_meta")
-            self.doc_table = doc_table_data
+            doc_data = json.load(f)
+            self.metadata = doc_data["metadata"]
+            self.doc_table = doc_data["documents"]
         
-        self.N = self.meta["total_docs"]
-        self.avg_len_T = self.meta["avg_len_T"]
-        self.avg_len_A = self.meta["avg_len_A"]
-        self.avg_len_C = self.meta["avg_len_C"]
-        
-        postings_path_T = os.path.join(self.index_dir, postings_file_T)
-        postings_path_A = os.path.join(self.index_dir, postings_file_A)
-        postings_path_C = os.path.join(self.index_dir, postings_file_C)
-        
-        self.fp_T = open(postings_path_T, "rb")
-        self.fp_A = open(postings_path_A, "rb")
-        self.fp_C = open(postings_path_C, "rb")
-        
-        self.k1 = 1.1
-        self.w_T = 2.5
-        self.w_A = 1.5
-        self.w_C = 1.1
-        self.b_T = 0.3
-        self.b_A = 0.75
-        self.b_C = 0.8
-    
-    def parse_query(self, user_query):
-        """
-        쿼리 파싱: prefix와 field 추출
-        
-        Returns:
-            dict: {
-                'is_and': bool,
-                'is_phrase': bool,
-                'is_verbose': bool,
-                'fields': list,  # ['T', 'A', 'C'] 또는 일부
-                'query_text': str
-            }
-        """
-        query_info = {
-            'is_and': False,
-            'is_phrase': False,
-            'is_verbose': False,
-            'fields': ['T', 'A', 'C'],
-            'query_text': user_query
+        self.N = len(self.doc_table)
+        self.avgdl = {
+            'T': self.metadata["avgdl_T"],
+            'A': self.metadata["avgdl_A"],
+            'C': self.metadata["avgdl_C"]
         }
         
-        remaining = user_query
+        postings_path = os.path.join(self.index_dir, postings_file)
+        self.fp = open(postings_path, "rb")
         
-        # Prefix 파싱
-        while True:
-            if remaining.startswith('[AND]'):
-                query_info['is_and'] = True
-                remaining = remaining[5:].strip()
-            elif remaining.startswith('[PHRASE]'):
-                query_info['is_phrase'] = True
-                remaining = remaining[8:].strip()
-            elif remaining.startswith('[VERBOSE]'):
-                query_info['is_verbose'] = True
-                remaining = remaining[9:].strip()
-            elif remaining.startswith('[V]'):
-                query_info['is_verbose'] = True
-                remaining = remaining[3:].strip()
-            elif remaining.startswith('[A]'):
-                query_info['is_and'] = True
-                remaining = remaining[3:].strip()
-            elif remaining.startswith('[P]'):
-                query_info['is_phrase'] = True
-                remaining = remaining[3:].strip()
-            else:
-                break
-        
-        # Field 파싱
-        specified_fields = []
-        while True:
-            match = re.match(r'\[FIELD=([TAC])\]', remaining)
-            if match:
-                specified_fields.append(match.group(1))
-                remaining = remaining[match.end():].strip()
-            else:
-                break
-        
-        if specified_fields:
-            query_info['fields'] = specified_fields
-        
-        # PHRASE는 무조건 Title만
-        if query_info['is_phrase']:
-            query_info['fields'] = ['T']
-        
-        query_info['query_text'] = remaining
-        
-        return query_info
+        self.postings_cache = {}
     
     def get_postings(self, term, field):
+        """특정 term의 특정 field 포스팅을 Dictionary로 반환 (캐싱 적용)"""
+        cache_key = (term, field)
+        if cache_key in self.postings_cache:
+            return self.postings_cache[cache_key]
+        
         if term not in self.term_dict:
-            return []
+            self.postings_cache[cache_key] = {}
+            return {}
         
-        if field not in self.term_dict[term]:
-            return []
+        entry = self.term_dict[term]
+        if field not in entry:
+            self.postings_cache[cache_key] = {}
+            return {}
         
-        entry = self.term_dict[term][field]
-        start_offset = entry["start"]
-        length = entry["length"]
+        field_entry = entry[field]
+        start_offset = field_entry["start"]
+        length = field_entry["length"]
         
-        fp_map = {"T": self.fp_T, "A": self.fp_A, "C": self.fp_C}
-        fp = fp_map[field]
-        
-        postings = []
-        fp.seek(start_offset)
+        postings = {}
+        self.fp.seek(start_offset)
         for _ in range(length):
-            data = fp.read(8)
+            data = self.fp.read(8)
             if len(data) != 8:
                 raise ValueError(f"Incomplete data read at offset {start_offset}")
             doc_id, freq = struct.unpack("ii", data)
-            postings.append((doc_id, freq))
+            postings[doc_id] = freq
         
+        self.postings_cache[cache_key] = postings
         return postings
     
-    def get_tf_for_doc(self, term, doc_id, field):
-        postings = self.get_postings(term, field)
-        for d_id, freq in postings:
-            if d_id == doc_id:
-                return freq
-        return 0
+    def clear_cache(self):
+        """포스팅 캐시 초기화"""
+        self.postings_cache = {}
     
-    def calculate_bm25f_score(self, term, doc_id):
-        df = self.term_dict[term]["df"]
-        idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1)
+    def parse_query(self, user_query):
+        """쿼리 파싱: Prefix와 Field 추출"""
+        verbose = False
+        and_mode = False
+        phrase_mode = False
+        explicit_fields = []
+        invalid_prefixes = []
         
+        ## valid_prefixes = {'VERBOSE', 'V', 'AND', 'A', 'PHRASE', 'P'}
+        
+        pattern = r'\[([^\]]+)\]'
+        matches = re.findall(pattern, user_query)
+        
+        for match in matches:
+            match_upper = match.upper()
+            if match_upper in ('VERBOSE', 'V'):
+                verbose = True
+            elif match_upper in ('AND', 'A'):
+                and_mode = True
+            elif match_upper in ('PHRASE', 'P'):
+                phrase_mode = True
+            elif match_upper.startswith('FIELD='):
+                field_char = match_upper[6:]
+                if field_char in ['T', 'A', 'C']:
+                    explicit_fields.append(field_char)
+                else:
+                    invalid_prefixes.append(f"[{match}]")
+            else:
+                invalid_prefixes.append(f"[{match}]")
+        
+        pure_query = re.sub(pattern, '', user_query).strip()
+        
+        if not explicit_fields:
+            fields = ['T', 'A', 'C']
+        else:
+            fields = explicit_fields
+        
+        return {
+            'verbose': verbose,
+            'and_mode': and_mode,
+            'phrase_mode': phrase_mode,
+            'fields': fields,
+            'explicit_fields': explicit_fields,
+            'query_text': pure_query,
+            'original_query': user_query,
+            'invalid_prefixes': invalid_prefixes
+        }
+    
+    def validate_query(self, parsed):
+        """쿼리 조합 유효성 검증"""
+        if parsed['phrase_mode']:
+            if parsed['and_mode']:
+                return "오류: [PHRASE]와 [AND]는 동시에 사용할 수 없습니다."
+            explicit = parsed['explicit_fields']
+            if 'A' in explicit or 'C' in explicit:
+                return "오류: [PHRASE]는 Title에서만 검색하므로 [FIELD=A] 또는 [FIELD=C]와 함께 사용할 수 없습니다."
+        return None
+    
+    def calculate_idf(self, df):
+        """BM25 IDF 계산"""
+        return math.log((self.N - df + 0.5) / (df + 0.5) + 1)
+    
+    def calculate_bm25f_score(self, query_terms, doc_id, fields):
+        """BM25F 점수 계산"""
+        score = 0.0
         doc_info = self.doc_table[str(doc_id)]
-        len_T = doc_info["len_T"]
-        len_A = doc_info["len_A"]
-        len_C = doc_info["len_C"]
-        
-        tf_T = self.get_tf_for_doc(term, doc_id, "T")
-        tf_A = self.get_tf_for_doc(term, doc_id, "A")
-        tf_C = self.get_tf_for_doc(term, doc_id, "C")
-        
-        if self.avg_len_T > 0:
-            norm_tf_T = tf_T / ((1 - self.b_T) + self.b_T * len_T / self.avg_len_T)
-        else:
-            norm_tf_T = 0
-        
-        if self.avg_len_A > 0:
-            norm_tf_A = tf_A / ((1 - self.b_A) + self.b_A * len_A / self.avg_len_A)
-        else:
-            norm_tf_A = 0
-        
-        if self.avg_len_C > 0:
-            norm_tf_C = tf_C / ((1 - self.b_C) + self.b_C * len_C / self.avg_len_C)
-        else:
-            norm_tf_C = 0
-        
-        tf_tilde = (self.w_T * norm_tf_T + 
-                   self.w_A * norm_tf_A + 
-                   self.w_C * norm_tf_C)
-        
-        score = idf * (self.k1 + 1) * tf_tilde / (self.k1 + tf_tilde)
-        
-        return score
-    
-    def search_and_query(self, query_terms, fields):
-        """AND 쿼리 처리: 모든 term이 존재하는 문서만"""
-        candidate_docs_per_term = []
         
         for term in query_terms:
             if term not in self.term_dict:
-                return {}
+                continue
             
-            docs_for_this_term = set()
+            df = self.term_dict[term]["df"]
+            idf = self.calculate_idf(df)
+            
+            tf_tilde = 0.0
+            
             for field in fields:
                 postings = self.get_postings(term, field)
-                for doc_id, _ in postings:
-                    docs_for_this_term.add(doc_id)
+                tf = postings.get(doc_id, 0)
+                
+                if tf > 0:
+                    dl = doc_info[f"len_{field}"]
+                    avgdl = self.avgdl[field]
+                    b_f = self.FIELD_B[field]
+                    w_f = self.FIELD_WEIGHTS[field]
+                    
+                    if avgdl > 0:
+                        normalized_tf = tf / ((1 - b_f) + b_f * (dl / avgdl))
+                    else:
+                        normalized_tf = tf
+                    
+                    tf_tilde += w_f * normalized_tf
             
-            candidate_docs_per_term.append(docs_for_this_term)
+            if tf_tilde > 0:
+                term_score = idf * ((self.K1 + 1) * tf_tilde) / (self.K1 + tf_tilde)
+                score += term_score
         
-        if not candidate_docs_per_term:
-            return {}
-        
-        # 교집합: 모든 term이 있는 문서
-        candidate_docs = set.intersection(*candidate_docs_per_term)
-        
-        # BM25F 스코어 계산
-        doc_scores = {}
-        for doc_id in candidate_docs:
-            score = 0.0
-            for term in query_terms:
-                if term in self.term_dict:
-                    score += self.calculate_bm25f_score(term, doc_id)
-            doc_scores[doc_id] = score
-        
-        return doc_scores
+        return score
     
-    def search_phrase_query(self, query_text):
-        """PHRASE 쿼리 처리: Title에서 정확히 일치하는 문서만"""
-        query_terms = extract_terms(query_text)
+    def get_candidate_docs(self, query_terms, fields, and_mode):
+        """검색 대상 문서 ID 집합 반환"""
+        if and_mode:
+            doc_sets = []
+            for term in query_terms:
+                if term not in self.term_dict:
+                    return set()
+                
+                term_docs = set()
+                for field in fields:
+                    postings = self.get_postings(term, field)
+                    term_docs.update(postings.keys())
+                
+                if not term_docs:
+                    return set()
+                
+                doc_sets.append(term_docs)
+            
+            if not doc_sets:
+                return set()
+            
+            result = doc_sets[0]
+            for doc_set in doc_sets[1:]:
+                result = result & doc_set
+            return result
+        else:
+            result = set()
+            for term in query_terms:
+                if term not in self.term_dict:
+                    continue
+                for field in fields:
+                    postings = self.get_postings(term, field)
+                    result.update(postings.keys())
+            return result
+    
+    def phrase_search(self, query_text, query_terms):
+        """PHRASE 검색: Title에서 exact matching"""
+        candidate_docs = self.get_candidate_docs(query_terms, ['T'], and_mode=True)
         
-        if not query_terms:
-            return {}
-        
-        # 첫 번째 term으로 후보 문서 수집
-        first_term = query_terms[0]
-        if first_term not in self.term_dict:
-            return {}
-        
-        candidate_docs = set()
-        postings = self.get_postings(first_term, 'T')
-        for doc_id, _ in postings:
-            candidate_docs.add(doc_id)
-        
-        # 각 문서의 Title에서 phrase matching 확인
-        matched_docs = {}
-        
+        matched_docs = []
         for doc_id in candidate_docs:
             doc_info = self.doc_table[str(doc_id)]
-            title_text = doc_info["T_text"]
-            title_terms = extract_terms(title_text)
-            
-            # Phrase 매칭 확인
-            if self._is_phrase_match(title_terms, query_terms):
-                # BM25F 스코어 계산
-                score = 0.0
-                for term in query_terms:
-                    if term in self.term_dict:
-                        score += self.calculate_bm25f_score(term, doc_id)
-                matched_docs[doc_id] = score
+            title_text = doc_info.get("T_text", "")
+            if query_text in title_text:
+                matched_docs.append(doc_id)
         
         return matched_docs
     
-    def _is_phrase_match(self, doc_terms, query_terms):
-        """문서의 term 리스트에서 query_terms가 연속으로 나타나는지 확인"""
-        if len(query_terms) > len(doc_terms):
-            return False
-        
-        for i in range(len(doc_terms) - len(query_terms) + 1):
-            if doc_terms[i:i+len(query_terms)] == query_terms:
-                return True
-        
-        return False
+    # ========== VERBOSE 관련 함수들 ==========
     
-    def search_or_query(self, query_terms, fields):
-        """OR 쿼리 처리: 기본 검색 (하나라도 있으면)"""
-        candidate_docs = set()
+    def get_document_fields(self, doc_id):
+        """원본 JSON 파일에서 title, abstract, claims 텍스트 가져오기"""
+        doc_info = self.doc_table[str(doc_id)]
+        file_path = doc_info["path"]
         
-        for term in query_terms:
-            if term in self.term_dict:
-                for field in fields:
-                    postings = self.get_postings(term, field)
-                    for doc_id, _ in postings:
-                        candidate_docs.add(doc_id)
+        with open(file_path, 'r', encoding='utf8') as f:
+            data = json.load(f)
         
-        doc_scores = {}
-        for doc_id in candidate_docs:
-            score = 0.0
-            for term in query_terms:
-                if term in self.term_dict:
-                    score += self.calculate_bm25f_score(term, doc_id)
-            doc_scores[doc_id] = score
+        dataset = data['dataset']
+        title = dataset.get('invention_title', '')
+        abstract = dataset.get('abstract', '')
+        claims = dataset.get('claims', '')
         
-        return doc_scores
+        return {'T': title, 'A': abstract, 'C': claims}
     
-    def highlight_results(self, ranked_docs, query_terms, query_info):
-        """상위 5개 문서에 대해 highlighting 수행"""
-        top_docs = ranked_docs[:5]
-        
-        print()
-        for doc_id, score in top_docs:
-            doc_info = self.doc_table[str(doc_id)]
-            filename = os.path.basename(doc_info["relpath"])
-            
-            print("-" * 50)
-            print(f"파일명: {filename}, 점수: {score:.2f}")
-            
-            if query_info['is_phrase']:
-                self._highlight_phrase(doc_info, query_info['query_text'], query_terms)
-            elif query_info['is_and']:
-                self._highlight_and(doc_info, query_terms, query_info['fields'])
-            else:
-                self._highlight_or(doc_info, query_terms, query_info['fields'])
-        
-        print("-" * 50)
+    def find_term_positions(self, text, terms):
+        """텍스트에서 각 term의 모든 위치 찾기"""
+        positions = []
+        for term in terms:
+            start = 0
+            while True:
+                idx = text.find(term, start)
+                if idx == -1:
+                    break
+                positions.append((idx, idx + len(term), term))
+                start = idx + 1
+        return sorted(positions, key=lambda x: x[0])
     
-    def _highlight_phrase(self, doc_info, query_text, query_terms):
-        """PHRASE highlighting: Title에서 정확히 일치하는 부분"""
-        title_text = doc_info["T_text"]
-        title_terms = extract_terms(title_text)
+    def highlight_text(self, text, terms):
+        """텍스트에서 검색어들을 <<...>>로 감싸기"""
+        positions = self.find_term_positions(text, terms)
+        if not positions:
+            return text
         
-        # Phrase 위치 찾기
-        phrase_start = -1
-        for i in range(len(title_terms) - len(query_terms) + 1):
-            if title_terms[i:i+len(query_terms)] == query_terms:
-                phrase_start = i
-                break
+        result = []
+        last_end = 0
+        for start, end, term in positions:
+            if start >= last_end:
+                result.append(text[last_end:start])
+                result.append(f"<<{term}>>")
+                last_end = end
+        result.append(text[last_end:])
         
-        if phrase_start == -1:
-            return
-        
-        # 원본 텍스트에서 phrase 위치 찾기 및 highlighting
-        highlighted = self._highlight_in_text(title_text, query_terms, window_size=80)
-        
-        if highlighted:
-            print(f"[TITLE] {highlighted}")
+        return ''.join(result)
     
-    def _highlight_and(self, doc_info, query_terms, fields):
-        """AND highlighting: 모든 term이 나타날 때까지 여러 부분 출력"""
-        field_priority = []
-        if 'T' in fields:
-            field_priority.append(('T', doc_info["T_text"], "TITLE"))
-        if 'A' in fields:
-            field_priority.append(('A', doc_info["A_text"], "ABSTRACT"))
-        if 'C' in fields:
-            field_priority.append(('C', doc_info["C_text"], "CLAIMS"))
-        
-        highlighted_terms = set()
-        
-        for field_code, text, field_name in field_priority:
-            if not text:
-                continue
-            
-            remaining_terms = [t for t in query_terms if t not in highlighted_terms]
-            if not remaining_terms:
-                break
-            
-            snippet = self._find_snippet_with_terms(text, remaining_terms)
-            if snippet:
-                highlighted_snippet = self._highlight_in_text(snippet, remaining_terms, window_size=80)
-                if highlighted_snippet:
-                    print(f"[{field_name}] {highlighted_snippet}")
-                    
-                    # 이번에 출력된 term들 기록
-                    for term in remaining_terms:
-                        if term in snippet:
-                            highlighted_terms.add(term)
-    
-    def _highlight_or(self, doc_info, query_terms, fields):
-        """OR highlighting: 최대한 많은 서로 다른 term을 포함한 한 부분만 출력"""
-        field_priority = []
-        if 'T' in fields:
-            field_priority.append(('T', doc_info["T_text"], "TITLE"))
-        if 'A' in fields:
-            field_priority.append(('A', doc_info["A_text"], "ABSTRACT"))
-        if 'C' in fields:
-            field_priority.append(('C', doc_info["C_text"], "CLAIMS"))
-        
-        best_snippet = None
-        best_field_name = None
-        best_term_count = 0
-        
-        for field_code, text, field_name in field_priority:
-            if not text:
-                continue
-            
-            snippet, term_count = self._find_best_snippet(text, query_terms)
-            if term_count > best_term_count:
-                best_snippet = snippet
-                best_field_name = field_name
-                best_term_count = term_count
-        
-        if best_snippet:
-            highlighted = self._highlight_in_text(best_snippet, query_terms, window_size=80)
-            if highlighted:
-                print(f"[{best_field_name}] {highlighted}")
-    
-    def _find_best_snippet(self, text, query_terms):
-        """텍스트에서 가장 많은 서로 다른 query term을 포함한 snippet 찾기"""
-        if not text:
-            return "", 0
-        
-        text_terms = extract_terms(text)
+    def find_best_window_or(self, text, query_terms):
+        """OR/일반 검색용: 가장 다양한 검색어가 많이 등장하는 window 찾기"""
+        positions = self.find_term_positions(text, query_terms)
+        if not positions:
+            return None, set()
         
         best_start = 0
-        best_unique_terms = 0
-        window_size = 40
+        best_unique_terms = set()
         
-        for i in range(len(text_terms)):
-            end = min(i + window_size, len(text_terms))
-            window_terms = text_terms[i:end]
-            unique_terms = len(set(window_terms) & set(query_terms))
+        for pos_start, pos_end, term in positions:
+            window_start = max(0, pos_start - self.WINDOW_SIZE // 2)
+            window_end = min(len(text), window_start + self.WINDOW_SIZE)
             
-            if unique_terms > best_unique_terms:
+            if window_end - window_start < self.WINDOW_SIZE and window_end == len(text):
+                window_start = max(0, window_end - self.WINDOW_SIZE)
+            
+            unique_terms = set()
+            for p_start, p_end, p_term in positions:
+                if p_start >= window_start and p_end <= window_end:
+                    unique_terms.add(p_term)
+            
+            if len(unique_terms) > len(best_unique_terms):
                 best_unique_terms = unique_terms
-                best_start = i
+                best_start = window_start
         
-        # 원본 텍스트에서 해당 부분 추출
-        snippet_terms = text_terms[best_start:min(best_start + window_size, len(text_terms))]
-        snippet = self._reconstruct_text(text, snippet_terms)
-        
-        return snippet, best_unique_terms
+        return best_start, best_unique_terms
     
-    def _find_snippet_with_terms(self, text, terms):
-        """텍스트에서 주어진 term들을 포함한 부분 찾기"""
-        if not text or not terms:
-            return ""
+    def create_snippet_or(self, text, query_terms):
+        """OR/일반 검색용: 다양한 검색어가 많은 window의 snippet 생성"""
+        best_start, unique_terms = self.find_best_window_or(text, query_terms)
+        if not unique_terms:
+            return None, set()
         
-        text_terms = extract_terms(text)
+        window_end = min(len(text), best_start + self.WINDOW_SIZE)
+        snippet = text[best_start:window_end]
+        highlighted = self.highlight_text(snippet, query_terms)
         
-        for i, t in enumerate(text_terms):
-            if t in terms:
-                start = max(0, i - 20)
-                end = min(len(text_terms), i + 20)
-                snippet_terms = text_terms[start:end]
-                return self._reconstruct_text(text, snippet_terms)
-        
-        return ""
+        return highlighted, unique_terms
     
-    def _reconstruct_text(self, original_text, terms):
-        """term 리스트로부터 원본 텍스트의 해당 부분 재구성"""
-        if not terms:
-            return ""
-        
-        # 간단한 방법: 원본 텍스트에서 첫 term이 나타나는 위치부터 80자 추출
-        first_term = terms[0]
-        idx = original_text.find(first_term)
+    def create_snippet_phrase(self, title_text, query_text):
+        """PHRASE 검색용: 검색어 전체를 가운데에 배치한 snippet 생성"""
+        idx = title_text.find(query_text)
         if idx == -1:
-            return original_text[:80]
+            return None
         
-        start = max(0, idx - 20)
-        end = min(len(original_text), idx + 60)
+        phrase_center = idx + len(query_text) // 2
+        half_window = self.WINDOW_SIZE // 2
         
-        return original_text[start:end]
-    
-    def _highlight_in_text(self, text, query_terms, window_size=80):
-        """텍스트에서 query_terms를 <<term>> 형식으로 highlighting"""
-        if not text:
-            return ""
+        window_start = max(0, phrase_center - half_window)
+        window_end = min(len(title_text), window_start + self.WINDOW_SIZE)
         
-        # Window 크기 조정
-        if len(text) > window_size:
-            text_terms = extract_terms(text)
-            for i, term in enumerate(text_terms):
-                if term in query_terms:
-                    start = max(0, i - 10)
-                    end = min(len(text_terms), i + 10)
-                    snippet_terms = text_terms[start:end]
-                    text = self._reconstruct_text(text, snippet_terms)
-                    break
+        if window_end - window_start < self.WINDOW_SIZE and window_end == len(title_text):
+            window_start = max(0, window_end - self.WINDOW_SIZE)
         
-        # Highlighting
-        highlighted = text
-        for term in query_terms:
-            pattern = re.escape(term)
-            highlighted = re.sub(f'({pattern})', r'<<\1>>', highlighted, flags=re.IGNORECASE)
+        snippet = title_text[window_start:window_end]
+        highlighted = snippet.replace(query_text, f"<<{query_text}>>")
         
         return highlighted
     
+    def find_snippets_and(self, doc_fields, query_terms, fields):
+        """AND 검색용: 모든 검색어가 나올 때까지 여러 field의 snippet 수집"""
+        found_terms = set()
+        snippets = []
+        
+        field_info = []
+        for field in fields:
+            text = doc_fields[field]
+            if not text:
+                continue
+            _, unique_terms = self.find_best_window_or(text, query_terms)
+            if unique_terms:
+                field_info.append((field, len(unique_terms), unique_terms))
+        
+        field_info.sort(key=lambda x: x[1], reverse=True)
+        
+        for field, _, unique_terms in field_info:
+            new_terms = unique_terms - found_terms
+            if not new_terms:
+                continue
+            
+            text = doc_fields[field]
+            highlighted, _ = self.create_snippet_or(text, query_terms)
+            if highlighted:
+                snippets.append((field, highlighted))
+                found_terms.update(unique_terms)
+            
+            if found_terms >= set(query_terms):
+                break
+        
+        return snippets
+    
+    def print_verbose_or(self, doc_id, score, query_terms, fields):
+        """OR/일반 검색의 VERBOSE 출력"""
+        doc_info = self.doc_table[str(doc_id)]
+        filename = doc_info["filename"]
+        doc_fields = self.get_document_fields(doc_id)
+        
+        print(f"파일명: {filename}, 점수: {score:.2f}")
+        
+        best_field = None
+        best_snippet = None
+        best_unique_count = 0
+        
+        for field in ['T', 'A', 'C']:
+            if field not in fields:
+                continue
+            text = doc_fields[field]
+            if not text:
+                continue
+            
+            snippet, unique_terms = self.create_snippet_or(text, query_terms)
+            if snippet and len(unique_terms) > best_unique_count:
+                best_unique_count = len(unique_terms)
+                best_field = field
+                best_snippet = snippet
+        
+        if best_field and best_snippet:
+            print(f"[{self.FIELD_NAMES[best_field]}] {best_snippet}")
+    
+    def print_verbose_phrase(self, doc_id, score, query_text):
+        """PHRASE 검색의 VERBOSE 출력"""
+        doc_info = self.doc_table[str(doc_id)]
+        filename = doc_info["filename"]
+        title_text = doc_info.get("T_text", "")
+        
+        print(f"파일명: {filename}, 점수: {score:.2f}")
+        
+        snippet = self.create_snippet_phrase(title_text, query_text)
+        if snippet:
+            print(f"[{self.FIELD_NAMES['T']}] {snippet}")
+    
+    def print_verbose_and(self, doc_id, score, query_terms, fields):
+        """AND 검색의 VERBOSE 출력"""
+        doc_info = self.doc_table[str(doc_id)]
+        filename = doc_info["filename"]
+        doc_fields = self.get_document_fields(doc_id)
+        
+        print(f"파일명: {filename}, 점수: {score:.2f}")
+        
+        snippets = self.find_snippets_and(doc_fields, query_terms, fields)
+        for field, snippet in snippets:
+            print(f"[{self.FIELD_NAMES[field]}] {snippet}")
+    
+    def print_verbose_results(self, ranked_docs, query_terms, query_text, parsed):
+        """VERBOSE 모드 결과 출력"""
+        print("-" * 50)
+        
+        top_k = min(5, len(ranked_docs))
+        
+        for doc_id, score in ranked_docs[:top_k]:
+            if parsed['phrase_mode']:
+                self.print_verbose_phrase(doc_id, score, query_text)
+            elif parsed['and_mode']:
+                self.print_verbose_and(doc_id, score, query_terms, parsed['fields'])
+            else:
+                self.print_verbose_or(doc_id, score, query_terms, parsed['fields'])
+            print()
+    
     def process_query(self, user_query):
         """쿼리 처리 메인 함수"""
-        # 쿼리 파싱
-        query_info = self.parse_query(user_query)
-        query_text = query_info['query_text']
+        self.clear_cache()
         
-        if not query_text.strip():
-            print("\n검색어를 찾을 수 없습니다.")
+        parsed = self.parse_query(user_query)
+        
+        if parsed['invalid_prefixes']:
+            invalid_str = ', '.join(parsed['invalid_prefixes'])
+            print(f"잘못된 형식이 입력되었습니다: {invalid_str}")
             return
         
-        # 쿼리 실행
-        if query_info['is_phrase']:
-            doc_scores = self.search_phrase_query(query_text)
-            query_terms = extract_terms(query_text)
-        elif query_info['is_and']:
-            query_terms = extract_terms(query_text)
-            doc_scores = self.search_and_query(query_terms, query_info['fields'])
-        else:
-            query_terms = extract_terms(query_text)
-            doc_scores = self.search_or_query(query_terms, query_info['fields'])
+        error_msg = self.validate_query(parsed)
+        if error_msg:
+            print(error_msg)
+            return
         
-        # 랭킹
+        query_terms = extract_terms(parsed['query_text'])
+        
+        if not query_terms:
+            print("\nRESULT:")
+            print(f"검색어 입력: {user_query}")
+            print("총 0개 문서 검색")
+            return
+        
+        if parsed['phrase_mode']:
+            matched_docs = self.phrase_search(parsed['query_text'], query_terms)
+            
+            doc_scores = {}
+            for doc_id in matched_docs:
+                score = self.calculate_bm25f_score(query_terms, doc_id, ['T'])
+                if score > 0:
+                    doc_scores[doc_id] = score
+        else:
+            candidate_docs = self.get_candidate_docs(query_terms, parsed['fields'], parsed['and_mode'])
+            
+            doc_scores = {}
+            for doc_id in candidate_docs:
+                score = self.calculate_bm25f_score(query_terms, doc_id, parsed['fields'])
+                if score > 0:
+                    doc_scores[doc_id] = score
+        
         ranked_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
         
-        # 기본 결과 출력
         print("\nRESULT:")
         print(f"검색어 입력: {user_query}")
         print(f"총 {len(ranked_docs)}개 문서 검색")
         
-        top_n = min(5, len(ranked_docs))
-        print(f"상위 {top_n}개 문서:")
+        top_k = min(5, len(ranked_docs))
+        if top_k > 0:
+            print(f"상위 {top_k}개 문서:")
+            for doc_id, score in ranked_docs[:top_k]:
+                doc_info = self.doc_table[str(doc_id)]
+                filename = doc_info["filename"]
+                print(f"  {filename}  {score:.2f}")
         
-        if not query_info['is_verbose']:
-            for doc_id, score in ranked_docs[:5]:
-                doc_info = self.doc_table[str(doc_id)]
-                filename = os.path.basename(doc_info["relpath"])
-                print(f"  {filename}  {score:.2f}")
-        else:
-            for doc_id, score in ranked_docs[:5]:
-                doc_info = self.doc_table[str(doc_id)]
-                filename = os.path.basename(doc_info["relpath"])
-                print(f"  {filename}  {score:.2f}")
-            
-            # Verbose: highlighting
-            self.highlight_results(ranked_docs, query_terms, query_info)
+        if parsed['verbose'] and top_k > 0:
+            self.print_verbose_results(ranked_docs, query_terms, parsed['query_text'], parsed)
